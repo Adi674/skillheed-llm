@@ -1,0 +1,33 @@
+# requirements.txt - FINAL FIXED VERSION with compatible dependencies
+# Updated pip first, then install these compatible versions
+
+# Core FastAPI and web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart
+
+# LangChain packages - COMPATIBLE VERSIONS
+langchain>=0.2.0
+langchain-groq>=0.1.9
+langchain-community>=0.2.0
+
+# Embedding and ML libraries
+sentence-transformers>=2.2.0
+torch>=2.2.0
+transformers>=4.36.0
+numpy>=1.24.0
+
+# Vector database
+pinecone>=3.0.0
+
+# Database and backend
+supabase>=2.3.0
+
+# Configuration and utilities
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# HTTP and utilities
+httpx>=0.25.0
+tiktoken>=0.5.0
