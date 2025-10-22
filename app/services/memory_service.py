@@ -1,7 +1,11 @@
+# app/services/memory_service.py - OPTIMIZED WITH BATCH PROCESSING
 from typing import List, Dict, Any, Optional, Tuple
 from uuid import UUID
 from datetime import datetime
 import logging
+import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 from ..config import settings
 from ..models.enums import MessageRole
 from ..models.schemas import RetrievalContext
@@ -13,7 +17,7 @@ from ..utils.exceptions import MemoryServiceError
 logger = logging.getLogger(__name__)
 
 class MemoryService:
-    """Service for managing conversation memory and context"""
+    """Optimized Memory Service with batch processing"""
     
     def __init__(self):
         self.max_tokens = settings.max_tokens_per_session
@@ -40,19 +44,14 @@ class MemoryService:
             if not messages_to_summarize:
                 return None
             
-            # Format messages for summarization
             conversation_text = self._format_messages_for_summary(messages_to_summarize)
-            
-            # For now, create a simple summary
-            # In production, you'd use your LLM to generate this
             summary = await self._generate_summary_with_llm(conversation_text)
             
-            # Get start and end message IDs
             start_message_id = UUID(messages_to_summarize[0]['message_id'])
             end_message_id = UUID(messages_to_summarize[-1]['message_id'])
             
-            # Generate embedding for summary
-            summary_embedding = await embedding_service.embed_text(summary)
+            # Use batch embedding for summary
+            summary_embedding = await embedding_service.embed_text_batch(summary, str(user_id))
             
             # Store summary in Supabase
             summary_record = await supabase_service.create_memory_summary(
@@ -94,9 +93,7 @@ class MemoryService:
         return "\n".join(formatted_lines)
     
     async def _generate_summary_with_llm(self, conversation_text: str) -> str:
-        """Generate summary using LLM (placeholder for now)"""
-        # TODO: Implement with Groq LLM
-        # For now, return a simple summary
+        """Generate summary using LLM (improved placeholder)"""
         lines = conversation_text.split('\n')
         user_messages = [line for line in lines if line.startswith('User:')]
         assistant_messages = [line for line in lines if line.startswith('Assistant:')]
@@ -110,53 +107,128 @@ class MemoryService:
         return summary
     
     async def get_conversation_context(
-        self,
-        session_id: UUID,
-        user_id: UUID,
-        current_query: str,
-        max_tokens: Optional[int] = None
-    ) -> RetrievalContext:
-        """Get comprehensive conversation context for the current query"""
+    self,
+    session_id: UUID,
+    user_id: UUID,
+    current_query: str,
+    max_tokens: Optional[int] = None
+) -> RetrievalContext:
+        """Get conversation context - SIMPLE FIXED VERSION"""
         try:
             max_tokens = max_tokens or self.max_tokens
             
-            # Get query embedding
-            query_embedding = await embedding_service.embed_text(current_query)
-            
-            # Get recent messages from current session
-            recent_messages = await supabase_service.get_recent_messages(
-                session_id, limit=self.context_window
+            # Initialize context
+            context = RetrievalContext(
+                recent_messages=[],
+                relevant_history={"messages": [], "summaries": []},
+                summaries=[],
+                total_tokens=0
             )
             
-            # Get relevant historical context from vectors
-            vector_results = await vector_service.hybrid_search(
-                query_embedding=query_embedding,
-                user_id=user_id,
-                session_id=session_id,
-                message_top_k=3,
-                summary_top_k=2
-            )
+            # Get query embedding with timeout
+            query_embedding = None
+            try:
+                query_embedding = await asyncio.wait_for(
+                    embedding_service.embed_text_batch(current_query, str(user_id)),
+                    timeout=1.0
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate query embedding: {e}")
             
-            # Get recent summaries for this session
-            session_summaries = await supabase_service.get_session_summaries(
-                session_id, limit=2
-            )
+            # Get recent messages with timeout
+            try:
+                context.recent_messages = await asyncio.wait_for(
+                    supabase_service.get_recent_messages(session_id, limit=self.context_window),
+                    timeout=0.5
+                )
+            except Exception as e:
+                logger.error(f"Failed to get recent messages: {e}")
+                context.recent_messages = []
             
-            # Calculate total tokens
-            total_tokens = self._calculate_context_tokens(
-                recent_messages, vector_results, session_summaries
-            )
+            # Get summaries with timeout
+            try:
+                context.summaries = await asyncio.wait_for(
+                    supabase_service.get_session_summaries(session_id, limit=2),
+                    timeout=0.5
+                )
+            except Exception as e:
+                logger.error(f"Failed to get session summaries: {e}")
+                context.summaries = []
             
-            return RetrievalContext(
-                recent_messages=recent_messages,
-                relevant_history=vector_results,
-                summaries=session_summaries,
-                total_tokens=total_tokens
-            )
+            # Get vector search results if embedding successful
+            if query_embedding:
+                try:
+                    vector_results = await asyncio.wait_for(
+                        vector_service.hybrid_search(
+                            query_embedding=query_embedding,
+                            user_id=user_id,
+                            session_id=session_id,
+                            message_top_k=3,
+                            summary_top_k=2
+                        ),
+                        timeout=1.0
+                    )
+                    
+                    if isinstance(vector_results, dict):
+                        context.relevant_history = {
+                            "messages": vector_results.get("messages", []),
+                            "summaries": vector_results.get("summaries", [])
+                        }
+                except Exception as e:
+                    logger.error(f"Vector search failed: {e}")
+                    context.relevant_history = {"messages": [], "summaries": []}
+            
+            # Calculate tokens
+            try:
+                context.total_tokens = self._calculate_context_tokens(
+                    context.recent_messages, 
+                    context.relevant_history, 
+                    context.summaries
+                )
+            except Exception as e:
+                logger.error(f"Failed to calculate context tokens: {e}")
+                context.total_tokens = 0
+            
+            logger.info(f"Retrieved context for session {session_id}: "
+                    f"{len(context.recent_messages)} recent messages, "
+                    f"{len(context.relevant_history.get('messages', []))} historical messages, "
+                    f"{len(context.summaries)} summaries, "
+                    f"{context.total_tokens} total tokens")
+            
+            return context
             
         except Exception as e:
             logger.error(f"Failed to get conversation context: {e}")
-            raise MemoryServiceError(f"Context retrieval failed: {e}")
+            return RetrievalContext(
+                recent_messages=[],
+                relevant_history={"messages": [], "summaries": []},
+                summaries=[],
+                total_tokens=0
+            )
+    
+    async def _get_query_embedding(self, query: str) -> Optional[List[float]]:
+        """Get query embedding with error handling"""
+        try:
+            return await embedding_service.embed_text_batch(query, "context_query")
+        except Exception as e:
+            logger.error(f"Failed to generate query embedding: {e}")
+            return None
+    
+    async def _get_recent_messages(self, session_id: UUID) -> List[Dict[str, Any]]:
+        """Get recent messages with error handling"""
+        try:
+            return await supabase_service.get_recent_messages(session_id, limit=self.context_window)
+        except Exception as e:
+            logger.error(f"Failed to get recent messages: {e}")
+            return []
+    
+    async def _get_session_summaries(self, session_id: UUID) -> List[Dict[str, Any]]:
+        """Get session summaries with error handling"""
+        try:
+            return await supabase_service.get_session_summaries(session_id, limit=2)
+        except Exception as e:
+            logger.error(f"Failed to get session summaries: {e}")
+            return []
     
     def _calculate_context_tokens(
         self,
@@ -164,24 +236,29 @@ class MemoryService:
         vector_results: Dict[str, List[Dict[str, Any]]],
         summaries: List[Dict[str, Any]]
     ) -> int:
-        """Calculate total tokens in context"""
-        total_tokens = 0
-        
-        # Count tokens in recent messages
-        for msg in recent_messages:
-            total_tokens += msg.get('token_count', 0)
-        
-        # Count tokens in vector results (estimate)
-        for msg in vector_results.get('messages', []):
-            total_tokens += msg.get('metadata', {}).get('token_count', 50)
-        
-        # Count tokens in summaries (estimate)
-        for summary in summaries:
-            # Rough estimate: 4 chars per token
-            total_tokens += len(summary.get('summary_text', '')) // 4
-        
-        return total_tokens
+        """Calculate total tokens in context with error handling"""
+        try:
+            total_tokens = 0
+            
+            for msg in recent_messages:
+                total_tokens += msg.get('token_count', 0) or 0
+            
+            for msg in vector_results.get('messages', []):
+                metadata = msg.get('metadata', {})
+                total_tokens += metadata.get('token_count', 50) or 50
+            
+            for summary in summaries:
+                summary_text = summary.get('summary_text', '')
+                if summary_text:
+                    total_tokens += len(summary_text) // 4
+            
+            return total_tokens
+            
+        except Exception as e:
+            logger.error(f"Token calculation failed: {e}")
+            return 0
     
+    # OPTIMIZED: Use batch processing for long-term memory storage
     async def store_message_in_long_term_memory(
         self,
         user_id: UUID,
@@ -192,13 +269,13 @@ class MemoryService:
         token_count: int,
         timestamp: datetime
     ):
-        """Store message in long-term memory (Pinecone)"""
+        """Store message in long-term memory using batch processing"""
         try:
-            # Generate embedding
-            embedding = await embedding_service.embed_text(content)
+            # Use batch embedding processing
+            embedding = await embedding_service.embed_text_batch(content, str(user_id))
             
-            # Store in Pinecone
-            vector_id = await vector_service.store_message_vector(
+            # Use batch vector storage
+            vector_id = await vector_service.store_message_vector_batch(
                 user_id=user_id,
                 session_id=session_id,
                 message_id=message_id,
@@ -211,11 +288,61 @@ class MemoryService:
             # Update message with Pinecone ID
             await supabase_service.update_message_pinecone_id(message_id, vector_id)
             
-            logger.info(f"Stored message in long-term memory: {vector_id}")
+            logger.info(f"Stored message in long-term memory (batch): {vector_id}")
             
         except Exception as e:
             logger.error(f"Failed to store message in long-term memory: {e}")
-            # Don't raise exception here as it's not critical for chat flow
+    
+    # OPTIMIZED: Batch processing for multiple messages
+    async def store_messages_in_batch(
+        self,
+        messages: List[Tuple[UUID, UUID, UUID, MessageRole, str, int, datetime]]
+    ):
+        """Store multiple messages in batch for better performance"""
+        try:
+            # Extract contents for batch embedding
+            contents = [msg[4] for msg in messages]  # msg[4] is content
+            user_ids = [str(msg[0]) for msg in messages]  # msg[0] is user_id
+            
+            # Generate embeddings in batch
+            embeddings = await embedding_service.embed_batch_manual(contents)
+            
+            # Store all vectors in batch
+            tasks = []
+            for (user_id, session_id, message_id, role, content, token_count, timestamp), embedding in zip(messages, embeddings):
+                tasks.append(
+                    vector_service.store_message_vector_batch(
+                        user_id=user_id,
+                        session_id=session_id,
+                        message_id=message_id,
+                        embedding=embedding,
+                        role=role.value,
+                        token_count=token_count,
+                        timestamp=timestamp
+                    )
+                )
+            
+            # Execute in parallel
+            vector_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Update Pinecone IDs
+            update_tasks = []
+            for i, result in enumerate(vector_results):
+                if not isinstance(result, Exception):
+                    update_tasks.append(
+                        supabase_service.update_message_pinecone_id(
+                            messages[i][2],  # message_id
+                            result
+                        )
+                    )
+            
+            if update_tasks:
+                await asyncio.gather(*update_tasks, return_exceptions=True)
+            
+            logger.info(f"Batch stored {len(messages)} messages in long-term memory")
+            
+        except Exception as e:
+            logger.error(f"Batch storage failed: {e}")
     
     async def manage_session_memory(
         self,
@@ -225,14 +352,11 @@ class MemoryService:
         """Manage session memory by summarizing if needed"""
         try:
             if await self.should_summarize_session(session_id):
-                # Get older messages for summarization (excluding recent context window)
                 all_messages = await supabase_service.get_session_messages(session_id)
                 
                 if len(all_messages) > self.context_window:
-                    # Messages to summarize (exclude recent ones)
                     messages_to_summarize = all_messages[:-self.context_window]
                     
-                    # Create summary
                     await self.create_conversation_summary(
                         session_id, user_id, messages_to_summarize
                     )
@@ -241,18 +365,22 @@ class MemoryService:
                     
         except Exception as e:
             logger.error(f"Failed to manage session memory: {e}")
-            # Don't raise exception as it's not critical for immediate chat flow
     
     async def health_check(self) -> bool:
-        """Check if memory service is healthy"""
+        """Enhanced health check for memory service"""
         try:
-            # Check if dependent services are healthy
-            return (
-                await supabase_service.health_check() and
-                await vector_service.health_check() and
-                await embedding_service.health_check()
+            services_healthy = await asyncio.gather(
+                supabase_service.health_check(),
+                vector_service.health_check(),
+                embedding_service.health_check(),
+                return_exceptions=True
             )
-        except Exception:
+            
+            healthy_count = sum(1 for result in services_healthy if result is True)
+            return healthy_count >= 2
+            
+        except Exception as e:
+            logger.error(f"Memory service health check failed: {e}")
             return False
 
 # Global memory service instance

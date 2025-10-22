@@ -13,8 +13,9 @@ from .services.vector_service import vector_service
 from .services.embedding_service import embedding_service
 from .services.memory_service import memory_service
 
-# Import API routers - FIXED
-from .api import chat, sessions, health
+from .api.chat import router as chat_router
+from .api.sessions import router as sessions_router
+from .api.health import router as health_router
 
 from .utils.exceptions import ChatbotError
 
@@ -97,10 +98,9 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 # Include routers
-app.include_router(health.router, prefix="/health", tags=["Health"])
-app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
-app.include_router(sessions.router, prefix="/api/v1/sessions", tags=["Sessions"])
-
+app.include_router(health_router, prefix="/health", tags=["Health"])
+app.include_router(chat_router, prefix="/api/v1/chat", tags=["Chat"])
+app.include_router(sessions_router, prefix="/api/v1/sessions", tags=["Sessions"])
 # Root endpoint
 @app.get("/")
 async def root():

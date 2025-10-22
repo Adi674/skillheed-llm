@@ -1,9 +1,12 @@
-# app/services/supabase_service.py
+# app/services/supabase_service.py - ENHANCED VERSION
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 from datetime import datetime
 from supabase import create_client, Client
 import logging
+from tenacity import retry, stop_after_attempt, wait_exponential
+import asyncio
+
 from ..config import settings
 from ..models.schemas import MessageResponse, SessionResponse, MemorySummaryResponse
 from ..models.enums import MessageRole, SessionStatus
@@ -12,76 +15,128 @@ from ..utils.exceptions import DatabaseError
 logger = logging.getLogger(__name__)
 
 class SupabaseService:
-    """Service for all Supabase database operations - connects to existing database"""
+    """Service for all Supabase database operations - ENHANCED VERSION"""
     
     def __init__(self):
         self.client: Optional[Client] = None
+        self._initialized = False
+        self._max_retries = 3
     
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def initialize(self):
-        """Initialize Supabase client to connect to existing database"""
+        """Initialize Supabase client with retry logic and schema verification"""
         try:
             self.client = create_client(
                 settings.supabase_url,
-                settings.supabase_service_key  # Updated to match config field name
+                settings.supabase_service_key
             )
             
-            # Test connection with existing users table
-            test_query = self.client.table('users').select('user_id').limit(1).execute()
-            logger.info("Supabase client connected to existing database successfully")
+            # Verify database schema
+            await self._verify_schema()
+            
+            self._initialized = True
+            logger.info("Supabase service initialized successfully")
             
         except Exception as e:
-            logger.error(f"Failed to connect to Supabase database: {e}")
-            raise DatabaseError(f"Database connection failed: {e}")
+            logger.error(f"Failed to initialize Supabase: {e}")
+            raise DatabaseError(f"Database initialization failed: {e}")
     
-    # Session Operations - Work with your existing sessions table
+    async def _verify_schema(self):
+        """Verify required tables exist and are accessible"""
+        required_tables = ['users', 'sessions', 'messages', 'memory_summaries']
+        
+        for table in required_tables:
+            try:
+                # Test table access with minimal query
+                result = self.client.table(table).select('*').limit(1).execute()
+                logger.info(f"Table '{table}' verified successfully")
+            except Exception as e:
+                logger.error(f"Table '{table}' verification failed: {e}")
+                raise DatabaseError(f"Required table '{table}' not found or accessible: {e}")
+    
+    def _ensure_initialized(self):
+        """Ensure service is initialized before operations"""
+        if not self._initialized or not self.client:
+            raise DatabaseError("Supabase service not initialized. Call initialize() first.")
+    
+    # ERROR HANDLING DECORATOR
+    def handle_database_errors(func):
+        """Decorator to handle database errors consistently"""
+        async def wrapper(self, *args, **kwargs):
+            self._ensure_initialized()
+            try:
+                return await func(self, *args, **kwargs)
+            except DatabaseError:
+                raise
+            except Exception as e:
+                logger.error(f"Database operation failed in {func.__name__}: {e}")
+                raise DatabaseError(f"Database operation failed: {e}")
+        return wrapper
+    
+    # Session Operations
+    @handle_database_errors
     async def create_session(
         self, 
         user_id: UUID, 
         session_name: str = "New Chat"
     ) -> SessionResponse:
-        """Create a new chat session in existing sessions table"""
+        """Create a new chat session with proper error handling"""
         try:
-            result = self.client.table('sessions').insert({
+            # Validate user exists first
+            if not await self.verify_user_exists(user_id):
+                raise DatabaseError(f"User {user_id} does not exist")
+            
+            session_data = {
                 'user_id': str(user_id),
                 'session_name': session_name,
                 'session_status': SessionStatus.ACTIVE.value,
                 'context_limit': settings.context_window_size
-            }).execute()
+            }
+            
+            result = self.client.table('sessions').insert(session_data).execute()
             
             if not result.data:
-                raise DatabaseError("Failed to create session")
+                raise DatabaseError("Failed to create session - no data returned")
             
             session_data = result.data[0]
+            logger.info(f"Created session {session_data.get('session_id')} for user {user_id}")
+            
             return SessionResponse(**session_data)
             
+        except DatabaseError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to create session: {e}")
+            logger.error(f"Session creation failed: {e}")
             raise DatabaseError(f"Session creation failed: {e}")
     
+    @handle_database_errors
     async def get_session(self, session_id: UUID, user_id: UUID) -> Optional[SessionResponse]:
-        """Get session by ID and user ID from existing sessions table"""
+        """Get session with proper error handling"""
         try:
             result = self.client.table('sessions').select('*').eq(
                 'session_id', str(session_id)
             ).eq('user_id', str(user_id)).eq(
                 'session_status', SessionStatus.ACTIVE.value
-            ).single().execute()
+            ).execute()
             
             if result.data:
-                return SessionResponse(**result.data)
+                return SessionResponse(**result.data[0])
+            
+            logger.warning(f"Session {session_id} not found for user {user_id}")
             return None
             
         except Exception as e:
-            logger.error(f"Failed to get session: {e}")
+            logger.error(f"Failed to get session {session_id}: {e}")
             return None
     
+    @handle_database_errors
     async def get_user_sessions(
         self, 
         user_id: UUID, 
         limit: int = 50, 
         offset: int = 0
     ) -> List[SessionResponse]:
-        """Get all sessions for a user from existing sessions table"""
+        """Get all sessions for a user"""
         try:
             result = self.client.table('sessions').select(
                 '*'
@@ -107,7 +162,8 @@ class SupabaseService:
         except Exception as e:
             logger.warning(f"Failed to update session activity: {e}")
     
-    # Message Operations - Work with your existing messages table
+    # Message Operations
+    @handle_database_errors
     async def create_message(
         self,
         session_id: UUID,
@@ -117,13 +173,25 @@ class SupabaseService:
         token_count: Optional[int] = None,
         embedding: Optional[List[float]] = None
     ) -> MessageResponse:
-        """Create a new message in existing messages table"""
+        """Create message with validation and error handling"""
         try:
+            # Validate session exists
+            session = await self.get_session(session_id, user_id)
+            if not session:
+                raise DatabaseError(f"Session {session_id} not found or not accessible")
+            
+            # Validate content
+            if not content or len(content.strip()) == 0:
+                raise DatabaseError("Message content cannot be empty")
+            
+            if len(content) > 4000:
+                raise DatabaseError("Message content too long")
+            
             message_data = {
                 'session_id': str(session_id),
                 'user_id': str(user_id),
                 'role': role.value,
-                'content': content,
+                'content': content.strip(),
                 'token_count': token_count
             }
             
@@ -133,15 +201,20 @@ class SupabaseService:
             result = self.client.table('messages').insert(message_data).execute()
             
             if not result.data:
-                raise DatabaseError("Failed to create message")
+                raise DatabaseError("Failed to create message - no data returned")
             
-            # Update session activity (handled by database trigger)
+            # Update session activity
             await self.update_session_activity(session_id)
             
-            return MessageResponse(**result.data[0])
+            message_data = result.data[0]
+            logger.info(f"Created message {message_data.get('message_id')} in session {session_id}")
             
+            return MessageResponse(**message_data)
+            
+        except DatabaseError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to create message: {e}")
+            logger.error(f"Message creation failed: {e}")
             raise DatabaseError(f"Message creation failed: {e}")
     
     async def get_session_messages(
@@ -150,7 +223,9 @@ class SupabaseService:
         limit: Optional[int] = None,
         include_embeddings: bool = False
     ) -> List[Dict[str, Any]]:
-        """Get messages for a session from existing messages table"""
+        """Get messages for a session"""
+        self._ensure_initialized()
+        
         try:
             query = self.client.table('messages')
             
@@ -176,7 +251,9 @@ class SupabaseService:
         session_id: UUID,
         limit: int = 10
     ) -> List[Dict[str, Any]]:
-        """Get recent messages for context from existing messages table"""
+        """Get recent messages for context"""
+        self._ensure_initialized()
+        
         try:
             result = self.client.table('messages').select(
                 'message_id,role,content,token_count,created_at'
@@ -196,7 +273,7 @@ class SupabaseService:
         message_id: UUID,
         pinecone_id: str
     ):
-        """Update message with Pinecone vector ID in existing messages table"""
+        """Update message with Pinecone vector ID"""
         try:
             self.client.table('messages').update({
                 'pinecone_id': pinecone_id,
@@ -206,7 +283,8 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Failed to update message Pinecone ID: {e}")
     
-    # Memory Summary Operations - Work with your existing memory_summaries table
+    # Memory Summary Operations
+    @handle_database_errors
     async def create_memory_summary(
         self,
         session_id: UUID,
@@ -217,7 +295,7 @@ class SupabaseService:
         end_message_id: UUID,
         embedding: Optional[List[float]] = None
     ) -> MemorySummaryResponse:
-        """Create a memory summary in existing memory_summaries table"""
+        """Create a memory summary"""
         try:
             summary_data = {
                 'session_id': str(session_id),
@@ -247,7 +325,9 @@ class SupabaseService:
         session_id: UUID,
         limit: int = 5
     ) -> List[Dict[str, Any]]:
-        """Get memory summaries for a session from existing memory_summaries table"""
+        """Get memory summaries for a session"""
+        self._ensure_initialized()
+        
         try:
             result = self.client.table('memory_summaries').select(
                 '*'
@@ -262,7 +342,9 @@ class SupabaseService:
             raise DatabaseError(f"Failed to retrieve summaries: {e}")
     
     async def count_session_messages(self, session_id: UUID) -> int:
-        """Count total messages in a session from existing messages table"""
+        """Count total messages in a session"""
+        self._ensure_initialized()
+        
         try:
             result = self.client.table('messages').select(
                 'message_id', count='exact'
@@ -274,9 +356,11 @@ class SupabaseService:
             logger.error(f"Failed to count session messages: {e}")
             return 0
     
-    # User Operations - Work with your existing users table
+    # User Operations
     async def get_user(self, user_id: UUID) -> Optional[Dict[str, Any]]:
-        """Get user from existing users table"""
+        """Get user"""
+        self._ensure_initialized()
+        
         try:
             result = self.client.table('users').select('*').eq(
                 'user_id', str(user_id)
@@ -289,7 +373,9 @@ class SupabaseService:
             return None
     
     async def verify_user_exists(self, user_id: UUID) -> bool:
-        """Verify user exists in existing users table"""
+        """Verify user exists"""
+        self._ensure_initialized()
+        
         try:
             result = self.client.table('users').select('user_id').eq(
                 'user_id', str(user_id)
@@ -302,13 +388,17 @@ class SupabaseService:
             return False
     
     async def health_check(self) -> bool:
-        """Check if Supabase connection is healthy by querying existing users table"""
+        """Enhanced health check with actual database operation"""
         try:
-            # Simple query to test connection with existing table
+            if not self._initialized or not self.client:
+                return False
+            
+            # Test with actual query
             result = self.client.table('users').select('user_id').limit(1).execute()
             return True
             
-        except Exception:
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
             return False
 
 # Global Supabase service instance
