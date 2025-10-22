@@ -1,8 +1,8 @@
-# app/models/schemas.py - FIXED RetrievalContext model
+# app/models/schemas.py - FIXED VERSION
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from uuid import UUID
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from .enums import MessageRole, SessionStatus
 
 # Request Models
@@ -86,10 +86,40 @@ class SummaryMetadata(VectorMetadata):
 
 # FIXED: RetrievalContext with correct data structure
 class RetrievalContext(BaseModel):
-    recent_messages: List[Dict[str, Any]]
-    relevant_history: Dict[str, List[Dict[str, Any]]]  # FIXED: Should be a dict with 'messages' and 'summaries' keys
-    summaries: List[Dict[str, Any]]
-    total_tokens: int
+    recent_messages: List[Dict[str, Any]] = Field(default_factory=list)
+    relevant_history: Dict[str, List[Dict[str, Any]]] = Field(
+        default_factory=lambda: {"messages": [], "summaries": []}
+    )
+    summaries: List[Dict[str, Any]] = Field(default_factory=list)
+    total_tokens: int = 0
+    
+    # ADD VALIDATION
+    @validator('relevant_history')
+    def validate_relevant_history(cls, v):
+        if not isinstance(v, dict):
+            return {"messages": [], "summaries": []}
+        
+        # Ensure required keys exist
+        if 'messages' not in v:
+            v['messages'] = []
+        if 'summaries' not in v:
+            v['summaries'] = []
+        
+        # Validate list types
+        if not isinstance(v['messages'], list):
+            v['messages'] = []
+        if not isinstance(v['summaries'], list):
+            v['summaries'] = []
+            
+        return v
+    
+    @validator('total_tokens')
+    def validate_total_tokens(cls, v):
+        return max(0, v)  # Ensure non-negative
+    
+    class Config:
+        # Allow arbitrary types for flexibility
+        arbitrary_types_allowed = True
 
 # Error Models
 class ErrorResponse(BaseModel):
