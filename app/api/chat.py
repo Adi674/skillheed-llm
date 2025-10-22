@@ -9,7 +9,23 @@ from ..services.memory_service import memory_service
 from ..services.embedding_service import embedding_service
 from ..utils.exceptions import DatabaseError, MemoryServiceError, EmbeddingServiceError
 
+# Direct LLM import to avoid chain import issues
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
+from ..config import settings
+
 router = APIRouter()
+
+# Initialize LLM directly
+def get_llm():
+    """Get LLM instance directly"""
+    return ChatGroq(
+        groq_api_key=settings.groq_api_key,
+        model_name=settings.groq_model,
+        temperature=settings.groq_temperature,
+        max_tokens=settings.groq_max_tokens,
+        streaming=settings.groq_streaming
+    )
 
 @router.post("/", response_model=ChatResponse)
 async def chat(
@@ -54,8 +70,8 @@ async def chat(
             current_query=request.message
         )
         
-        # Generate response using LangChain (placeholder for now)
-        assistant_response = await generate_response(request.message, context)
+        # Generate response using LLM directly (no chain import issues)
+        assistant_response = await generate_response_direct(request.message, context)
         
         # Count tokens in assistant response
         assistant_token_count = embedding_service.count_tokens(assistant_response)
@@ -95,23 +111,53 @@ async def chat(
     except (DatabaseError, MemoryServiceError, EmbeddingServiceError) as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to process chat message")
+        raise HTTPException(status_code=500, detail=f"Failed to process chat message: {str(e)}")
 
-async def generate_response(message: str, context) -> str:
-    """Generate response using LangChain (placeholder)"""
-    # TODO: Implement with LangChain RAG chain
-    # For now, return a simple response
-    
-    # Format context for response
-    context_info = ""
-    if context.recent_messages:
-        context_info += f"Recent conversation with {len(context.recent_messages)} messages. "
-    if context.relevant_history.get('messages'):
-        context_info += f"Found {len(context.relevant_history['messages'])} relevant historical messages. "
-    if context.relevant_history.get('summaries'):
-        context_info += f"Found {len(context.relevant_history['summaries'])} relevant conversation summaries. "
-    
-    return f"I understand your message: '{message}'. {context_info}This is a placeholder response. In production, this would use the RAG chain with Groq LLM."
+async def generate_response_direct(message: str, context) -> str:
+    """Generate response using Groq LLM directly - no chain imports"""
+    try:
+        # Format context for response
+        context_info = ""
+        if context.recent_messages:
+            recent_formatted = "\n".join([
+                f"{msg['role']}: {msg['content']}" 
+                for msg in context.recent_messages[-5:]  # Last 5 messages
+            ])
+            context_info += f"Recent conversation:\n{recent_formatted}\n\n"
+        
+        if context.relevant_history.get('messages'):
+            context_info += f"Found {len(context.relevant_history['messages'])} relevant historical messages. "
+        
+        if context.relevant_history.get('summaries'):
+            context_info += f"Found {len(context.relevant_history['summaries'])} relevant conversation summaries. "
+        
+        # Create prompt for Llama 3.3
+        prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a helpful AI assistant. Provide accurate, relevant, and concise responses based on the conversation context and retrieved information.
+
+{context_info}
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{message}
+
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+        
+        # Get LLM and call it
+        llm = get_llm()
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        
+        # Extract content
+        if hasattr(response, 'content'):
+            return response.content.strip()
+        else:
+            return str(response).strip()
+            
+    except Exception as e:
+        return f"I apologize, but I'm having trouble connecting to the AI service. Error: {str(e)}. Please try again."
 
 async def background_memory_tasks(
     user_id: UUID,
@@ -201,3 +247,28 @@ async def get_session_context(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to retrieve context")
+
+@router.get("/test-llm")
+async def test_llm_connection():
+    """Test endpoint to verify LLM is working"""
+    try:
+        llm = get_llm()
+        test_response = await llm.ainvoke([
+            HumanMessage(content="Hello! Please respond with 'LLM is working correctly' to confirm the connection.")
+        ])
+        
+        content = test_response.content if hasattr(test_response, 'content') else str(test_response)
+        
+        return {
+            "status": "success",
+            "llm_working": True,
+            "test_response": content,
+            "model": settings.groq_model
+        }
+    except Exception as e:
+        return {
+            "status": "error", 
+            "llm_working": False,
+            "error": str(e),
+            "model": settings.groq_model
+        }
